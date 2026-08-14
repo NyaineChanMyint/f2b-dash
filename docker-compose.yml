@@ -1,0 +1,40 @@
+services:
+  dashboard:
+    build:
+      context: .
+    image: f2b-dashboard-central:latest
+    environment:
+      F2B_API_TOKEN: ${F2B_API_TOKEN:?Set F2B_API_TOKEN in .env}
+    volumes:
+      - dashboard-data:/var/lib/f2b-dashboard
+    expose:
+      - "8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - internal
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+    networks:
+      - internal
+
+volumes:
+  dashboard-data:
+
+networks:
+  internal:
+    driver: bridge

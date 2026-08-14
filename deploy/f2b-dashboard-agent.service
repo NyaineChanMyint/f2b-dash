@@ -1,0 +1,11 @@
+[Unit]
+Description=Fail2Ban Dashboard Central agent
+After=fail2ban.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/f2b-dashboard-agent.env
+ExecStart=/usr/bin/python3 /opt/f2b-dashboard-central/agent/f2b-agent.py --url ${F2B_CENTRAL_URL} --token ${F2B_API_TOKEN} --host %H
+User=root
+

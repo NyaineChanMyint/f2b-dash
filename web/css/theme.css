@@ -1,0 +1,168 @@
+/* ============================================================
+   Fail2Ban Dashboard — Theme System
+   Dark theme (default) + Light theme via [data-theme="light"]
+   ============================================================ */
+
+:root {
+  /* --- Dark theme (default) --- */
+
+  /* Backgrounds */
+  --bg-primary: #0f1117;
+  --bg-secondary: #161922;
+  --bg-card: #1c1f2e;
+  --bg-card-hover: #232738;
+  --bg-header: #12141d;
+  --bg-input: #1c1f2e;
+
+  /* Text */
+  --text-primary: #e8eaf0;
+  --text-secondary: #8b8fa3;
+  --text-muted: #5c6078;
+  --text-inverse: #0f1117;
+
+  /* Accent */
+  --accent: #38bdf8;
+  --accent-hover: #7dd3fc;
+  --accent-muted: rgba(56, 189, 248, 0.15);
+
+  /* Semantic */
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --info: #60a5fa;
+
+  /* Borders & Shadows */
+  --border: #2a2d3e;
+  --border-light: #1f2233;
+  --shadow: 0 1px 3px rgba(6, 9, 20, 0.55), 0 1px 2px rgba(6, 9, 20, 0.4);
+  --shadow-lg: 0 4px 12px rgba(6, 9, 20, 0.65), 0 2px 4px rgba(6, 9, 20, 0.5);
+  --shadow-card: 0 1px 4px rgba(6, 9, 20, 0.4);
+
+  /* Chart colors — jail palette (supports up to 8 jails) */
+  --chart-jail-1: #f87171;   /* red — sshd (default) */
+  --chart-jail-2: #fbbf24;   /* amber — asterisk (default) */
+  --chart-jail-3: #a78bfa;   /* violet */
+  --chart-jail-4: #34d399;   /* emerald */
+  --chart-jail-5: #60a5fa;   /* blue */
+  --chart-jail-6: #f472b6;   /* pink */
+  --chart-jail-7: #5eead4;   /* teal */
+  --chart-jail-8: #fb923c;   /* orange */
+  /* Legacy aliases (kept for backward compat) */
+  --chart-sshd: var(--chart-jail-1);
+  --chart-asterisk: var(--chart-jail-2);
+  --chart-total: #38bdf8;
+  --chart-map: #db2777;
+  --chart-arc: var(--chart-map);    /* world-map attack arc fallback color (jail-coded otherwise) */
+  --chart-server: var(--chart-total); /* world-map server pin (arc target) */
+  --chart-grid: #2a2d3e;
+  --chart-text: #8b8fa3;
+  --chart-bg: transparent;
+
+  /* Scrollbar */
+  --scrollbar-track: #161922;
+  --scrollbar-thumb: #2a2d3e;
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  /* Spacing */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.9375rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 2rem;
+  --text-3xl: 2.5rem;
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.75;
+
+  /* Transition */
+  --transition-theme: 0.3s ease;
+}
+
+/* --- Light theme --- */
+[data-theme="light"] {
+  --bg-primary: #f5f6f8;
+  --bg-secondary: #ebedf2;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f8f9fb;
+  --bg-header: #ffffff;
+  --bg-input: #ebedf2;
+
+  --text-primary: #1a1c2b;
+  --text-secondary: #5c6078;
+  --text-muted: #9ca0b5;
+  --text-inverse: #ffffff;
+
+  --accent: #0284c7;
+  --accent-hover: #0369a1;
+  --accent-muted: rgba(2, 132, 199, 0.1);
+
+  --success: #059669;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --info: #2563eb;
+
+  --border: #d4d7e0;
+  --border-light: #e8eaef;
+  --shadow: 0 1px 3px rgba(100, 105, 120, 0.12), 0 1px 2px rgba(100, 105, 120, 0.08);
+  --shadow-lg: 0 4px 12px rgba(100, 105, 120, 0.14), 0 2px 4px rgba(100, 105, 120, 0.08);
+  --shadow-card: 0 1px 4px rgba(100, 105, 120, 0.08);
+
+  /* Chart colors — jail palette (light theme) */
+  --chart-jail-1: #dc2626;   /* red — sshd */
+  --chart-jail-2: #d97706;   /* amber — asterisk */
+  --chart-jail-3: #7c3aed;   /* violet */
+  --chart-jail-4: #059669;   /* emerald */
+  --chart-jail-5: #2563eb;   /* blue */
+  --chart-jail-6: #db2777;   /* pink */
+  --chart-jail-7: #0d9488;   /* teal */
+  --chart-jail-8: #ea580c;   /* orange */
+  --chart-sshd: var(--chart-jail-1);
+  --chart-asterisk: var(--chart-jail-2);
+  --chart-total: #0284c7;
+  --chart-map: #be185d;
+  --chart-arc: var(--chart-map);    /* world-map attack arc fallback color (jail-coded otherwise) */
+  --chart-server: var(--chart-total); /* world-map server pin (arc target) */
+  --chart-grid: #d4d7e0;
+  --chart-text: #5c6078;
+  --chart-bg: transparent;
+
+  --scrollbar-track: #ebedf2;
+  --scrollbar-thumb: #c4c7d4;
+}
+
+/* --- Global theme transition (targeted — avoids ECharts DOM performance hit) --- */
+.dashboard-container,
+.dashboard-header,
+.dashboard-footer,
+.card,
+.stat-card,
+.btn,
+.ip-table tr,
+.ip-status-badge,
+.jail-report-card,
+.jail-toggle__btn,
+.refresh-selector__select,
+.time-range-selector__select,
+.error-banner,
+.log-list__filter-input {
+  transition:
+    background-color var(--transition-theme),
+    color var(--transition-theme),
+    border-color var(--transition-theme),
+    box-shadow var(--transition-theme);
+}

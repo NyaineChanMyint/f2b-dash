@@ -1,0 +1,16 @@
+[Unit]
+Description=Fail2Ban Dashboard Central
+After=network.target
+
+[Service]
+Type=simple
+User=f2bdashboard
+WorkingDirectory=/opt/f2b-dashboard-central
+EnvironmentFile=/etc/f2b-dashboard-central.env
+ExecStart=/usr/bin/python3 /opt/f2b-dashboard-central/app/central.py
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

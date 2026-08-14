@@ -1,0 +1,1969 @@
+/**
+ * charts.js — Fail2Ban Dashboard Chart Rendering
+ * ECharts-based visualizations: trend chart, and future chart modules.
+ */
+
+(function () {
+  'use strict';
+
+  // ============================================================
+  // CSS Custom Property Helpers
+  // ============================================================
+
+  /**
+   * Read a CSS custom property value from :root.
+   * @param {string} prop - CSS variable name (e.g. '--chart-sshd')
+   * @returns {string} Computed value
+   */
+  function getCSSVar(prop) {
+    return getComputedStyle(document.documentElement).getPropertyValue(prop).trim();
+  }
+
+  /**
+   * Collect all chart-related colors from CSS custom properties.
+   * Called at render time so theme changes are reflected.
+   * @returns {object} Color map
+   */
+  function getChartColors() {
+    return {
+      sshd: getCSSVar('--chart-sshd'),
+      asterisk: getCSSVar('--chart-asterisk'),
+      total: getCSSVar('--chart-total'),
+      map: getCSSVar('--chart-map'),
+      arc: getCSSVar('--chart-arc') || getCSSVar('--chart-map'),
+      server: getCSSVar('--chart-server') || getCSSVar('--chart-total'),
+      grid: getCSSVar('--chart-grid'),
+      text: getCSSVar('--chart-text'),
+      bg: getCSSVar('--chart-bg'),
+      cardBg: getCSSVar('--bg-card'),
+      border: getCSSVar('--border'),
+    };
+  }
+
+  /**
+   * Build a tooltip style object from chart colors, theme-aware.
+   * @param {object} colors - Color map from getChartColors()
+   * @param {boolean} dark - Whether dark theme is active
+   * @returns {{backgroundColor: string, borderColor: string, borderWidth: number, textStyle: {color: string, fontSize: number}}}
+   */
+  function getTooltipStyle(colors, dark) {
+    return {
+      backgroundColor: dark ? 'rgba(15,17,23,0.92)' : 'rgba(255,255,255,0.96)',
+      borderColor: dark ? colors.grid : '#d4d7e0',
+      borderWidth: 1,
+      textStyle: { color: dark ? '#e8eaf0' : '#1a1c2b', fontSize: 13 }
+    };
+  }
+
+  /**
+   * Get the CSS color for a jail by its position in the jail list.
+   * Uses --chart-jail-N palette (1-8), cycling if more than 8 jails.
+   * @param {number} index - Zero-based jail index
+   * @returns {string} CSS color value
+   */
+  function getJailColor(index) {
+    var n = ((index % 8) + 8) % 8 + 1;  // 1-based, 1-8 cycling
+    return getCSSVar('--chart-jail-' + n);
+  }
+
+  /**
+   * Get a display label for a jail name.
+   * Checks i18n for a known jail key (charts.sshd, charts.asterisk),
+   * falls back to the raw jail name.
+   * @param {string} jail - Jail name (e.g. 'sshd', 'asterisk', 'recidive')
+   * @returns {string} Display label
+   */
+  function getJailLabel(jail) {
+    if (!jail) return '--';
+    var key = 'charts.' + jail;
+    var label = t(key);
+    return label !== key ? label : jail;
+  }
+
+  /**
+   * Create a vertical linear gradient for ECharts area fill.
+   * @param {string} hexColor - Hex color for the gradient
+   * @returns {object} ECharts LinearGradient object
+   */
+  function areaGradient(hexColor) {
+    if (typeof echarts === 'undefined' || !echarts.graphic) {
+      return { type: 'linear', x: 0, y: 0, x2: 0, y2: 1, colorStops: [
+        { offset: 0, color: window.hexToRgba(hexColor, 0.25) },
+        { offset: 1, color: window.hexToRgba(hexColor, 0) }
+      ] };
+    }
+    return new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+      { offset: 0, color: window.hexToRgba(hexColor, 0.25) },
+      { offset: 1, color: window.hexToRgba(hexColor, 0) }
+    ]);
+  }
+
+  // ============================================================
+  // Moving Average Calculation
+  // ============================================================
+
+  /**
+   * Calculate simple 7-day moving average for an array of values.
+   * @param {number[]} values - Array of numeric values
+   * @param {number} window - Window size (default 7)
+   * @returns {(number|null)[]} Array with nulls for positions without enough data
+   */
+  function movingAverage(values, window) {
+    if (window === undefined) window = 7;
+    var result = [];
+    for (var i = 0; i < values.length; i++) {
+      if (i < window - 1) {
+        result.push(null);
+      } else {
+        var sum = 0;
+        for (var j = 0; j < window; j++) {
+          sum += values[i - j];
+        }
+        result.push(Math.round(sum / window));
+      }
+    }
+    return result;
+  }
+
+  // ============================================================
+  // Time Range Filtering
+  // ============================================================
+
+  /**
+   * Filter data by time range, using the specified date field.
+   * @param {Array} data - Data array
+   * @param {string} timeRange - '24h', '7d', or 'all'
+   * @param {string} dateField - Property name holding the date string ('date' or 'timestamp')
+   * @returns {Array} Filtered data array
+   */
+  function filterByTimeRange(data, timeRange, dateField) {
+    if (!data || !data.length) return [];
+
+    if (timeRange === 'all') return data;
+
+    var now = new Date();
+    var cutoff;
+
+    if (timeRange === '24h') {
+      cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    } else if (timeRange === '7d') {
+      cutoff = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    } else {
+      return data;
+    }
+
+    return data.filter(function (item) {
+      return new Date(item[dateField]) >= cutoff;
+    });
+  }
+
+  // ============================================================
+  // Chart Instance Registry
+  // ============================================================
+
+  /** Store ECharts instances for resize and theme updates */
+  var chartInstances = {};
+
+  /** Store last render params for timeline chart re-render on theme/i18n change */
+  var _timelineRenderParams = null;
+
+  /**
+   * Get or create an ECharts instance on the given DOM element.
+   * @param {string} id - DOM element ID
+   * @returns {object|null} ECharts instance
+   */
+  function getChartInstance(id) {
+    if (typeof echarts === 'undefined') return null;
+    var dom = document.getElementById(id);
+    if (!dom) return null;
+
+    if (chartInstances[id]) {
+      return chartInstances[id];
+    }
+
+    var instance = echarts.init(dom);
+    chartInstances[id] = instance;
+    return instance;
+  }
+
+  // ============================================================
+  // Trend Chart
+  // ============================================================
+
+  /**
+   * Render the attack trend stacked bar chart with 7-day moving average.
+   * @param {string} containerId - DOM element ID for the chart container
+   * @param {Array} data - Trends data array [{date, sshd, asterisk, total, ...}]
+   * @param {string} timeRange - Time range filter: '24h', '7d', or 'all'
+   */
+  function renderTrendChart(containerId, data, timeRange) {
+    if (!timeRange) timeRange = 'all';
+
+    var chart = getChartInstance(containerId);
+    if (!chart) return;
+
+    var filtered = filterByTimeRange(data, timeRange, 'date');
+    if (!filtered.length) {
+      chart.clear();
+      chart.setOption({
+        title: {
+          text: t('errors.noData'),
+          left: 'center',
+          top: 'center',
+          textStyle: { color: getCSSVar('--text-muted'), fontSize: 14 }
+        }
+      });
+      return;
+    }
+
+    var colors = getChartColors();
+
+    // Dynamically detect jail names from the data (meta.jailNames or object keys)
+    var jailNames = (window._dashboardData && window._dashboardData.meta && window._dashboardData.meta.jailNames)
+      ? window._dashboardData.meta.jailNames
+      : [];
+    if (!jailNames.length && filtered.length) {
+      var sample = filtered[0];
+      for (var k in sample) {
+        if (k !== 'date' && k !== 'total' && k !== 'bans' && k !== 'unbans' && sample.hasOwnProperty(k)) {
+          jailNames.push(k);
+        }
+      }
+    }
+
+    var dates = filtered.map(function (d) { return d.date; });
+    var totalData = filtered.map(function (d) { return d.total; });
+    var maData = movingAverage(totalData, 7);
+
+    // Build per-jail label/color maps for tooltip
+    var jailLabels = [];
+    var jailColors = [];
+    for (var ji = 0; ji < jailNames.length; ji++) {
+      jailLabels.push(getJailLabel(jailNames[ji]));
+      jailColors.push(getJailColor(ji));
+    }
+
+    // Build series: one stacked bar per jail + moving average line
+    var trendSeries = [];
+    var legendData = [];
+    for (var si = 0; si < jailNames.length; si++) {
+      var jn = jailNames[si];
+      var jLabel = jailLabels[si];
+      var jColor = jailColors[si];
+      legendData.push(jLabel);
+      trendSeries.push({
+        name: jLabel,
+        type: 'bar',
+        stack: 'attacks',
+        data: filtered.map(function (d) { return d[jn] || 0; }),
+        itemStyle: {
+          color: jColor,
+          borderRadius: si === jailNames.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]
+        },
+        barMaxWidth: 28,
+        emphasis: {
+          itemStyle: { opacity: 0.85 }
+        }
+      });
+    }
+    legendData.push(t('charts.movingAverage'));
+    trendSeries.push({
+      name: t('charts.movingAverage'),
+      type: 'line',
+      data: maData,
+      smooth: 0.3,
+      symbol: 'none',
+      lineStyle: {
+        color: colors.total,
+        width: 2,
+        type: 'solid'
+      },
+      z: 10
+    });
+
+    var option = {
+      backgroundColor: colors.bg,
+
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: {
+          type: 'shadow',
+          shadowStyle: { color: 'rgba(255,255,255,0.05)' }
+        },
+        backgroundColor: colors.cardBg,
+        borderColor: colors.border,
+        textStyle: { color: colors.text, fontSize: 12 },
+        formatter: function (params) {
+          if (!params || !params.length) return '';
+
+          var dateStr = params[0].axisValue;
+          var html = '<div style="font-weight:600;margin-bottom:4px">' + dateStr + '</div>';
+
+          var jailVals = {};
+          var maVal = null;
+          var grandTotal = 0;
+
+          for (var i = 0; i < params.length; i++) {
+            var p = params[i];
+            if (p.seriesName === t('charts.movingAverage')) {
+              maVal = p.value;
+            } else {
+              jailVals[p.seriesName] = p.value;
+              grandTotal += p.value;
+            }
+          }
+
+          for (var ji = 0; ji < jailNames.length; ji++) {
+            var jLabel = jailLabels[ji];
+            var val = jailVals[jLabel] || 0;
+            html += '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">'
+              + '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:'
+              + jailColors[ji] + '"></span>'
+              + jLabel + ': <b>' + val.toLocaleString() + '</b></div>';
+          }
+
+          html += '<div style="display:flex;align-items:center;gap:6px;margin:2px 0;font-weight:600">'
+            + t('table.total') + ': <b>' + grandTotal.toLocaleString() + '</b></div>';
+
+          if (maVal !== null && maVal !== undefined) {
+            html += '<div style="display:flex;align-items:center;gap:6px;margin:2px 0;border-top:1px solid '
+              + colors.border + ';padding-top:4px;margin-top:4px">'
+              + '<span style="display:inline-block;width:10px;height:2px;background:'
+              + colors.total + '"></span>'
+              + t('charts.movingAverage') + ': <b>' + maVal.toLocaleString() + '</b></div>';
+          }
+
+          return html;
+        }
+      },
+
+      legend: {
+        data: legendData,
+        top: 0,
+        left: 'center',
+        textStyle: { color: colors.text, fontSize: 12 },
+        itemWidth: 14,
+        itemHeight: 10,
+        itemGap: 16
+      },
+
+      grid: {
+        left: 50,
+        right: 20,
+        top: 40,
+        bottom: 30,
+        containLabel: false
+      },
+
+      xAxis: {
+        type: 'category',
+        data: dates,
+        axisLine: { lineStyle: { color: colors.grid } },
+        axisTick: { lineStyle: { color: colors.grid } },
+        axisLabel: {
+          color: colors.text,
+          fontSize: 11,
+          rotate: dates.length > 14 ? 45 : 0,
+          formatter: function (val) {
+            // Show MM-DD format when many dates
+            if (dates.length > 14) {
+              var parts = val.split('-');
+              return parts.length >= 3 ? parts[1] + '-' + parts[2] : val;
+            }
+            return val;
+          }
+        },
+        splitLine: { show: false }
+      },
+
+      yAxis: {
+        type: 'value',
+        name: t('charts.count'),
+        nameTextStyle: { color: colors.text, fontSize: 11 },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: {
+          color: colors.text,
+          fontSize: 11,
+          formatter: function (val) {
+            if (val >= 1000) return (val / 1000).toFixed(val >= 10000 ? 0 : 1) + 'k';
+            return val;
+          }
+        },
+        splitLine: { lineStyle: { color: colors.grid, type: 'dashed' } }
+      },
+
+      animation: false,
+
+      series: trendSeries
+    };
+
+    chart.setOption(option, true);
+  }
+
+  // ============================================================
+  // Timeline Chart
+  // ============================================================
+
+  /**
+   * Render the attack timeline area chart.
+   * @param {string} containerId - DOM element ID (e.g., 'chart-timeline')
+   * @param {Array} data - Timeline data [{timestamp, sshd, asterisk, total}, ...]
+   * @param {string} timeRange - '24h', '7d', or 'all'
+   */
+  function renderTimelineChart(containerId, data, timeRange) {
+    if (!timeRange) timeRange = 'all';
+
+    // Store params for re-render on theme/i18n change
+    _timelineRenderParams = { containerId: containerId, data: data, timeRange: timeRange };
+
+    var chart = getChartInstance(containerId);
+    if (!chart) return;
+
+    var filtered = filterByTimeRange(data, timeRange, 'timestamp');
+    if (!filtered.length) {
+      chart.clear();
+      var emptyMsg = timeRange !== 'all' 
+        ? t('errors.noData') + '\n' + t('timeRange.switchToAll')
+        : t('errors.noData');
+      chart.setOption({
+        title: {
+          text: emptyMsg,
+          left: 'center',
+          top: 'center',
+          textStyle: { color: getCSSVar('--text-muted'), fontSize: 13 }
+        }
+      });
+      return;
+    }
+
+    var colors = getChartColors();
+    var dark = isDarkTheme();
+    var lang = getCurrentLang();
+
+    // Dynamically detect jail names from the data (meta.jailNames or object keys)
+    var jailNames = (window._dashboardData && window._dashboardData.meta && window._dashboardData.meta.jailNames)
+      ? window._dashboardData.meta.jailNames
+      : [];
+    if (!jailNames.length && filtered.length) {
+      // Fallback: extract from data object keys
+      var sample = filtered[0];
+      for (var k in sample) {
+        if (k !== 'timestamp' && k !== 'total' && sample.hasOwnProperty(k)) {
+          jailNames.push(k);
+        }
+      }
+    }
+
+    // Build series data per jail + total
+    var seriesData = [];
+    var legendData = [];
+    for (var ji = 0; ji < jailNames.length; ji++) {
+      var jn = jailNames[ji];
+      var jColor = getJailColor(ji);
+      var jLabel = getJailLabel(jn);
+      legendData.push(jLabel);
+      seriesData.push({
+        name: jLabel,
+        type: 'line',
+        smooth: true,
+        symbol: 'none',
+        connectNulls: false,
+        lineStyle: { width: 1.5, color: jColor },
+        itemStyle: { color: jColor },
+        areaStyle: { color: areaGradient(jColor) },
+        emphasis: { focus: 'series' },
+        data: filtered.map(function (d) { return [d.timestamp, d[jn] || 0]; })
+      });
+    }
+    // Total series
+    var totalData = filtered.map(function (d) { return [d.timestamp, d.total]; });
+    legendData.push(t('charts.total'));
+    seriesData.push({
+      name: t('charts.total'),
+      type: 'line',
+      smooth: true,
+      symbol: 'none',
+      connectNulls: false,
+      lineStyle: { width: 1.5, color: colors.total },
+      itemStyle: { color: colors.total },
+      areaStyle: { color: areaGradient(colors.total) },
+      emphasis: { focus: 'series' },
+      data: totalData
+    });
+
+    var tooltipStyle = getTooltipStyle(colors, dark);
+
+    function fmtDate(val) {
+      var d = new Date(val);
+      var locale = lang === 'zh' ? 'zh-TW' : 'en-US';
+      var tz = window.SERVER_TIMEZONE || 'UTC';
+      return d.toLocaleDateString(locale, { month: 'short', day: 'numeric', timeZone: tz });
+    }
+
+    function fmtDateTime(val) {
+      var d = new Date(val);
+      var locale = lang === 'zh' ? 'zh-TW' : 'en-US';
+      var tz = window.SERVER_TIMEZONE || 'UTC';
+      return d.toLocaleDateString(locale, { year: 'numeric', month: 'short', day: 'numeric', timeZone: tz }) +
+        ' ' + d.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit', timeZone: tz });
+    }
+
+    var option = {
+      backgroundColor: 'transparent',
+      animation: false,
+
+      tooltip: Object.assign({
+        trigger: 'axis',
+        padding: [10, 14],
+        formatter: function (params) {
+          if (!params || !params.length) return '';
+          var dateStr = fmtDateTime(params[0].value[0]);
+          var html = '<div style="font-weight:600;margin-bottom:6px;font-size:13px">' + dateStr + '</div>';
+          for (var i = 0; i < params.length; i++) {
+            html += '<div style="display:flex;align-items:center;gap:6px;margin:3px 0;font-size:12px">' +
+              '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + params[i].color + '"></span>' +
+              '<span>' + params[i].seriesName + '</span>' +
+              '<span style="margin-left:auto;font-weight:600">' + Number(params[i].value[1]).toLocaleString() + '</span>' +
+              '</div>';
+          }
+          return html;
+        }
+      }, tooltipStyle),
+
+      legend: {
+        data: legendData,
+        top: 4,
+        right: 16,
+        textStyle: { color: colors.text, fontSize: 12 },
+        icon: 'roundRect',
+        itemWidth: 14,
+        itemHeight: 8,
+        itemGap: 16
+      },
+
+      grid: {
+        top: 44,
+        right: 16,
+        bottom: 56,
+        left: 56,
+        containLabel: false
+      },
+
+      xAxis: {
+        type: 'time',
+        boundaryGap: false,
+        axisLine: { lineStyle: { color: colors.grid } },
+        axisTick: { lineStyle: { color: colors.grid } },
+        axisLabel: {
+          color: colors.text,
+          fontSize: 11,
+          formatter: function (val) { return fmtDate(val); }
+        },
+        splitLine: { show: false }
+      },
+
+      yAxis: {
+        type: 'value',
+        name: t('charts.attacks'),
+        nameTextStyle: { color: colors.text, fontSize: 11, padding: [0, 0, 0, -30] },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: {
+          color: colors.text,
+          fontSize: 11,
+          formatter: function (val) {
+            return val >= 1000 ? (val / 1000).toFixed(val >= 10000 ? 0 : 1) + 'k' : val;
+          }
+        },
+        splitLine: { lineStyle: { color: colors.grid, type: 'dashed' } }
+      },
+
+      dataZoom: [
+        {
+          type: 'slider',
+          bottom: 8,
+          height: 22,
+          borderColor: colors.grid,
+          backgroundColor: dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)',
+          fillerColor: hexToRgba(colors.total, 0.12),
+          handleStyle: { color: colors.total, borderColor: colors.total },
+          textStyle: { color: colors.text, fontSize: 10 },
+          dataBackground: {
+            lineStyle: { color: colors.grid },
+            areaStyle: { color: hexToRgba(colors.total, 0.08) }
+          },
+          selectedDataBackground: {
+            lineStyle: { color: colors.total },
+            areaStyle: { color: hexToRgba(colors.total, 0.15) }
+          }
+        },
+        {
+          type: 'inside',
+          zoomOnMouseWheel: true,
+          moveOnMouseMove: true
+        }
+      ],
+
+      series: seriesData
+    };
+
+    chart.setOption(option, true);
+  }
+
+  // ============================================================
+  // Relative Time Formatting
+  // ============================================================
+
+  /**
+   * Format an ISO timestamp as a relative time string.
+   * @param {string} isoTimestamp - ISO 8601 timestamp
+   * @returns {string} Relative time string (e.g., "2 hours ago")
+   */
+  function formatRelativeTime(isoTimestamp) {
+    if (!isoTimestamp) return '--';
+
+    var now = new Date();
+    var date = new Date(isoTimestamp);
+    var diffMs = now - date;
+
+    if (isNaN(diffMs)) return isoTimestamp;
+
+    var diffSec = Math.floor(diffMs / 1000);
+    var diffMin = Math.floor(diffSec / 60);
+    var diffHr = Math.floor(diffMin / 60);
+    var diffDay = Math.floor(diffHr / 24);
+
+    var lang = getCurrentLang();
+    var locale = lang === 'zh' ? 'zh-TW' : 'en-US';
+
+    if (diffSec < 60) {
+      return t('time.justNow');
+    } else if (diffMin < 60) {
+      return diffMin + ' ' + t('time.minutesAgo');
+    } else if (diffHr < 24) {
+      return diffHr + ' ' + t('time.hoursAgo');
+    } else if (diffDay < 30) {
+      return diffDay + ' ' + t('time.daysAgo', { count: diffDay });
+    } else {
+      var tz = window.SERVER_TIMEZONE || 'UTC';
+      return date.toLocaleDateString(locale, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        timeZone: tz
+      });
+    }
+  }
+
+  // ============================================================
+  // Top IPs Table Rendering
+  // ============================================================
+
+  /**
+   * Render the Top Attacking IPs ranking table.
+   * @param {Array} data - Array of top IP objects from data.topIPs
+   */
+  function renderTopIPsTable(data) {
+    var tbody = document.getElementById('top-ips-body');
+    if (!tbody) return;
+
+    // Handle empty/null data
+    if (!data || !data.length) {
+      tbody.innerHTML = '<tr><td colspan="7">' +
+        '<div class="empty-state">' + t('topIPs.noData') + '</div>' +
+        '</td></tr>';
+      return;
+    }
+
+    var html = '';
+
+    for (var i = 0; i < data.length; i++) {
+      var entry = data[i];
+      var rank = i + 1;
+      var isBanned = entry.isBanned || false;
+      var flag = getCountryFlag(entry.country);
+      var countryDisplay = flag ? flag + ' ' + (entry.country || '--') : (entry.country || '--');
+      var statusClass = isBanned ? 'ip-banned' : 'ip-active';
+      var statusText = isBanned ? t('topIPs.banned') : t('topIPs.active');
+      var rowClass = isBanned ? ' ip-table__row--banned' : '';
+
+      html += '<tr class="' + statusClass + rowClass + '">' +
+        '<td class="ip-table__rank">' + rank + '</td>' +
+        '<td class="ip-table__ip">' + escapeHtml(entry.ip || '--') + '</td>' +
+        '<td class="ip-table__country">' + escapeHtml(countryDisplay) + '</td>' +
+        '<td class="ip-table__count">' + Number(entry.count || 0).toLocaleString() + '</td>' +
+        '<td class="ip-table__jail">' + escapeHtml(entry.jail || '--') + '</td>' +
+        '<td class="ip-table__last-seen">' + formatRelativeTime(entry.lastSeen) + '</td>' +
+        '<td class="ip-table__status">' +
+          '<span class="ip-status-badge ip-status-badge--' + (isBanned ? 'banned' : 'active') + '">' +
+            statusText +
+          '</span>' +
+        '</td>' +
+        '</tr>';
+    }
+
+    tbody.innerHTML = html;
+  }
+
+  // ============================================================
+  // Resize Handler
+  // ============================================================
+
+  /**
+   * Resize all chart instances on window resize.
+   */
+  function handleResize() {
+    Object.keys(chartInstances).forEach(function (id) {
+      if (chartInstances[id] && !chartInstances[id].isDisposed()) {
+        chartInstances[id].resize();
+      }
+    });
+  }
+
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(handleResize, 150);
+  });
+
+  // ============================================================
+  // Theme & i18n Change Handlers
+  // ============================================================
+
+  /**
+   * Re-render all charts when theme or language changes.
+   * @param {object} data - Current dashboard data for re-rendering
+   */
+  function refreshChartsOnThemeChange(data) {
+    if (data && data.trends) {
+      renderTrendChart('chart-trend', data.trends, 'all');
+    }
+    if (_timelineRenderParams) {
+      renderTimelineChart(
+        _timelineRenderParams.containerId,
+        _timelineRenderParams.data,
+        _timelineRenderParams.timeRange
+      );
+    }
+    if (_heatmapRenderParams) {
+      renderHeatmap(
+        _heatmapRenderParams.containerId,
+        _heatmapRenderParams.data
+      );
+    }
+    if (_worldMapRenderParams) {
+      renderWorldMap(
+        _worldMapRenderParams.containerId,
+        _worldMapRenderParams.topIPs,
+        _worldMapRenderParams.server
+      );
+    }
+    if (_regionChartRenderParams) {
+      renderRegionChart(
+        _regionChartRenderParams.containerId,
+        _regionChartRenderParams.topIPs
+      );
+    }
+    if (_jailStatsRenderParams) {
+      renderJailStats(
+        _jailStatsRenderParams.containerId,
+        _jailStatsRenderParams.data
+      );
+    }
+    if (data && data.perJail && window._selectedJail && data.perJail[window._selectedJail]) {
+      renderPerJailMiniChart(window._selectedJail, data);
+    }
+  }
+
+  // ============================================================
+  // Attack Heatmap (Hour × Day)
+  // ============================================================
+
+  /** Store last render params for heatmap re-render on theme/i18n change */
+  var _heatmapRenderParams = null;
+
+  /**
+   * Render the attack heatmap (hour × day) using ECharts.
+   * @param {string} containerId - DOM element ID (e.g., 'chart-heatmap')
+   * @param {object} data - Dashboard data containing heatmap.grid (7×24 matrix)
+   */
+  function renderHeatmap(containerId, data) {
+    var chart = getChartInstance(containerId);
+    if (!chart) return;
+
+    // Store params for re-render on theme/i18n change
+    _heatmapRenderParams = { containerId: containerId, data: data };
+
+    var grid = (data && data.heatmap && data.heatmap.grid) ? data.heatmap.grid : null;
+    if (!grid || !grid.length) {
+      chart.clear();
+      chart.setOption({
+        title: {
+          text: t('errors.noData'),
+          left: 'center',
+          top: 'center',
+          textStyle: { color: getCSSVar('--text-muted'), fontSize: 14 }
+        }
+      });
+      return;
+    }
+
+    var colors = getChartColors();
+    var dark = isDarkTheme();
+
+    // Day names: Sun(0) .. Sat(6) — matches backend date +%w
+    var dayNames = [
+      t('heatmap.sunday'),
+      t('heatmap.monday'),
+      t('heatmap.tuesday'),
+      t('heatmap.wednesday'),
+      t('heatmap.thursday'),
+      t('heatmap.friday'),
+      t('heatmap.saturday')
+    ];
+
+    // Hour labels: "00:00" .. "23:00"
+    var hours = [];
+    for (var h = 0; h < 24; h++) {
+      hours.push((h < 10 ? '0' : '') + h + ':00');
+    }
+
+    // Build ECharts heatmap data: [hourIndex, dayIndex, value]
+    var heatData = [];
+    var maxVal = 0;
+    for (var di = 0; di < grid.length; di++) {
+      var row = grid[di];
+      for (var hi = 0; hi < row.length; hi++) {
+        var val = row[hi] || 0;
+        heatData.push([hi, di, val]);
+        if (val > maxVal) maxVal = val;
+      }
+    }
+
+    // Theme-aware gradient colors
+    var inRangeColor = dark
+      ? ['#1a1c2b', '#f87171']
+      : ['#e8eaf0', '#dc2626'];
+
+    var option = {
+      backgroundColor: 'transparent',
+      animation: false,
+
+      tooltip: Object.assign({
+        padding: [8, 12],
+        formatter: function (params) {
+          if (!params || params.value == null) return '';
+          var dayIdx = params.value[1];
+          var hourIdx = params.value[0];
+          var count = params.value[2];
+          return '<b>' + dayNames[dayIdx] + '</b> ' + hours[hourIdx] +
+            '<br/>' + t('charts.attacks') + ': <b>' + count.toLocaleString() + '</b>';
+        }
+      }, getTooltipStyle(colors, dark)),
+
+      grid: {
+        top: 10,
+        right: 60,
+        bottom: 30,
+        left: 60,
+        containLabel: false
+      },
+
+      xAxis: {
+        type: 'category',
+        data: hours,
+        position: 'bottom',
+        axisLine: { lineStyle: { color: colors.grid } },
+        axisTick: { show: false },
+        axisLabel: {
+          color: colors.text,
+          fontSize: 10,
+          interval: 2
+        },
+        splitLine: { show: false }
+      },
+
+      yAxis: {
+        type: 'category',
+        data: dayNames,
+        axisLine: { lineStyle: { color: colors.grid } },
+        axisTick: { show: false },
+        axisLabel: {
+          color: colors.text,
+          fontSize: 11
+        },
+        splitLine: { show: false }
+      },
+
+      visualMap: {
+        min: 0,
+        max: maxVal || 1,
+        calculable: false,
+        orient: 'vertical',
+        right: 4,
+        top: 'center',
+        itemHeight: 160,
+        itemWidth: 12,
+        text: [String(maxVal), '0'],
+        textStyle: { color: colors.text, fontSize: 10 },
+        inRange: {
+          color: inRangeColor
+        },
+        outOfRange: {
+          color: dark ? '#1a1c2b' : '#e8eaf0'
+        }
+      },
+
+      series: [{
+        type: 'heatmap',
+        data: heatData,
+        itemStyle: {
+          borderColor: dark ? '#0f1117' : '#ffffff',
+          borderWidth: 2,
+          borderRadius: 2
+        },
+        emphasis: {
+          itemStyle: {
+            borderColor: colors.total,
+            borderWidth: 2,
+            shadowBlur: 6,
+            shadowColor: 'rgba(0,0,0,0.3)'
+          }
+        },
+        progressive: 0
+      }]
+    };
+
+    chart.setOption(option, true);
+  }
+
+// ============================================================
+  // World Map Choropleth
+  // ============================================================
+
+  var _worldMapRegistered = false;
+  var _worldMapRegistering = false;
+  var _worldMapQueue = [];
+
+  function registerWorldMapAndRender(containerId, topIPs, server) {
+    if (_worldMapRegistered) {
+      renderWorldMap(containerId, topIPs, server);
+      return;
+    }
+
+    _worldMapQueue.push({ containerId: containerId, topIPs: topIPs, server: server });
+
+    if (_worldMapRegistering) return;
+    _worldMapRegistering = true;
+
+    var mapUrl = 'data/world.json';
+
+    fetch(mapUrl)
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function (geoJson) {
+        echarts.registerMap('world', geoJson);
+        _worldMapRegistered = true;
+        _worldMapRegistering = false;
+        for (var i = 0; i < _worldMapQueue.length; i++) {
+          renderWorldMap(_worldMapQueue[i].containerId, _worldMapQueue[i].topIPs, _worldMapQueue[i].server);
+        }
+        _worldMapQueue = [];
+      })
+      .catch(function (err) {
+        console.error('World map GeoJSON load failed:', err);
+        _worldMapRegistering = false;
+        // Show fallback for all queued requests
+        for (var i = 0; i < _worldMapQueue.length; i++) {
+          renderWorldMapFallback(_worldMapQueue[i].containerId, _worldMapQueue[i].topIPs);
+        }
+        _worldMapQueue = [];
+      });
+  }
+
+  /**
+   * Country name aliases — maps common data names to ECharts world map names.
+   * ECharts uses names from the world.json Geo data (mostly Natural Earth).
+   */
+  var COUNTRY_NAME_MAP = {
+    'The Netherlands': 'Netherlands',
+    'South Korea': 'Korea',
+    'Russia': 'Russia',
+    'Vietnam': 'Vietnam',
+    'Turkey': 'Turkey',
+    'Iran': 'Iran',
+    'Czech Republic': 'Czech Rep.',
+    'Hong Kong': 'China',
+    'New Zealand': 'New Zealand'
+  };
+
+  /**
+   * Aggregate topIPs data by country for the world map.
+   * Excludes special labels (Internal/Private, IPv6, Unknown) from map data
+   * but returns them separately for legend display.
+   * @param {Array} topIPs - Array of IP entry objects
+   * @returns {{ mapData: Array<{name:string, value:number, ipCount:number}>, specialLabels: Array<{label:string, count:number, ipCount:number}> }}
+   */
+  function aggregateByCountry(topIPs) {
+    if (!topIPs || !topIPs.length) {
+      return { mapData: [], specialLabels: [] };
+    }
+
+    var countryMap = {};
+    var specialLabels = [];
+    var specialKeys = [
+      { match: function (e) { return e.isPrivate; }, label: t('map.internalPrivate') },
+      { match: function (e) { return e.isIPv6; }, label: t('map.ipv6Unavailable') },
+      { match: function (e) { return !e.country || e.country === 'Unknown'; }, label: t('map.unknown') }
+    ];
+
+    for (var i = 0; i < topIPs.length; i++) {
+      var entry = topIPs[i];
+      var isSpecial = false;
+
+      for (var s = 0; s < specialKeys.length; s++) {
+        if (specialKeys[s].match(entry)) {
+          isSpecial = true;
+          var existing = null;
+          for (var k = 0; k < specialLabels.length; k++) {
+            if (specialLabels[k].label === specialKeys[s].label) {
+              existing = specialLabels[k];
+              break;
+            }
+          }
+          if (existing) {
+            existing.count += entry.count || 0;
+            existing.ipCount += 1;
+          } else {
+            specialLabels.push({ label: specialKeys[s].label, count: entry.count || 0, ipCount: 1 });
+          }
+          break;
+        }
+      }
+
+      if (isSpecial) continue;
+
+      var rawCountry = entry.country || 'Unknown';
+      var mapName = COUNTRY_NAME_MAP[rawCountry] || rawCountry;
+
+      if (countryMap[mapName]) {
+        countryMap[mapName].value += entry.count || 0;
+        countryMap[mapName].ipCount += 1;
+      } else {
+        countryMap[mapName] = { name: mapName, value: entry.count || 0, ipCount: 1 };
+      }
+    }
+
+    var mapData = [];
+    for (var key in countryMap) {
+      if (countryMap.hasOwnProperty(key)) {
+        mapData.push(countryMap[key]);
+      }
+    }
+
+    return { mapData: mapData, specialLabels: specialLabels };
+  }
+
+  var _worldMapRenderParams = null;
+  var SERVER_SERIES_NAME = '__f2b_server__';
+  var ATTACKER_SERIES_NAME = '__f2b_attackers__';
+
+  /**
+   * Resolve the server (arc target) coordinate. CONFIG.serverLat/serverLon take
+   * priority (manual override); otherwise fall back to dashboard.json.server from
+   * f2b-geoip.sh's ip.im lookup. Returns [lon, lat] for ECharts geo, or null.
+   * @param {object|null} server - {lat, lon, city, country, ip} from dashboard.json
+   * @returns {Array<number>|null} [lon, lat] or null
+   */
+  function resolveServerCoord(server) {
+    if (typeof CONFIG !== 'undefined' && CONFIG.serverLat != null && CONFIG.serverLon != null
+        && !isNaN(Number(CONFIG.serverLat)) && !isNaN(Number(CONFIG.serverLon))) {
+      return [Number(CONFIG.serverLon), Number(CONFIG.serverLat)];
+    }
+    if (server && server.lat != null && server.lon != null
+        && !isNaN(Number(server.lat)) && !isNaN(Number(server.lon))) {
+      return [Number(server.lon), Number(server.lat)];
+    }
+    return null;
+  }
+
+  /**
+   * Render the world map choropleth showing attack sources by country, augmented with
+   * attack arcs (attacker -> this server) when a server coordinate is available
+   * (from dashboard.json.server, detected by f2b-geoip.sh via ip.im). Absence of a
+   * server coordinate degrades gracefully to an attacker effectScatter layer (#3
+   * fallback). Hard failure to load world.json falls back to renderWorldMapFallback
+   * (country ranking table).
+   * @param {string} containerId - DOM element ID (e.g., 'chart-world-map')
+   * @param {Array} topIPs - Array of top IP objects with country, lat/lon, count, jail, ...
+   * @param {object} [server] - Optional server location {lat, lon, city, country, ip}
+   */
+  function renderWorldMap(containerId, topIPs, server) {
+    _worldMapRenderParams = { containerId: containerId, topIPs: topIPs, server: server };
+
+    if (!_worldMapRegistered) {
+      registerWorldMapAndRender(containerId, topIPs, server);
+      return;
+    }
+
+    var chart = getChartInstance(containerId);
+    if (!chart) return;
+
+    if (!topIPs || !topIPs.length) {
+      chart.clear();
+      chart.setOption({
+        title: {
+          text: t('errors.noData'),
+          left: 'center',
+          top: 'center',
+          textStyle: { color: getCSSVar('--text-muted'), fontSize: 14 }
+        }
+      });
+      return;
+    }
+
+    var colors = getChartColors();
+    var dark = isDarkTheme();
+    var reducedMotion = !!(typeof window !== 'undefined' && window.matchMedia
+                          && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+    // --- 1. Choropleth aggregation (unchanged) ---
+    var aggregated = aggregateByCountry(topIPs);
+    var mapData = aggregated.mapData;
+    var specialLabels = aggregated.specialLabels;
+
+    var maxVal = 0;
+    for (var i = 0; i < mapData.length; i++) {
+      if (mapData[i].value > maxVal) maxVal = mapData[i].value;
+    }
+    if (maxVal < 1) maxVal = 1;
+
+    var accentColor = colors.map || '#db2777';
+    var lowColor = dark ? hexToRgba(accentColor, 0.15) : hexToRgba(accentColor, 0.1);
+    var highColor = accentColor;
+    var serverColor = colors.server || colors.total || '#38bdf8';
+
+    // --- 2. Server coordinate (CONFIG override takes priority) ---
+    var serverCoord = resolveServerCoord(server);
+    var serverMeta = { city: '', country: '', ip: '' };
+    if (serverCoord) {
+      var usesConfigOverride = (typeof CONFIG !== 'undefined' && CONFIG.serverLat != null && CONFIG.serverLon != null);
+      if (!usesConfigOverride && server) {
+        serverMeta = { city: server.city || '', country: server.country || '', ip: server.ip || '' };
+      }
+    }
+
+    // --- 3. Stable jail color mapping (order of first appearance) ---
+    var jailIndex = {};
+    function jailColorFor(name) {
+      var key = name || '';
+      if (Object.prototype.hasOwnProperty.call(jailIndex, key)) {
+        return getJailColor(jailIndex[key]);
+      }
+      jailIndex[key] = Object.keys(jailIndex).length;
+      return getJailColor(jailIndex[key]);
+    }
+
+    // --- 4. Filter attacker points with usable lat/lon (skip private/IPv6/Unknown) ---
+    var attackerPoints = [];
+    for (var j = 0; j < topIPs.length; j++) {
+      var e = topIPs[j];
+      if (e.isPrivate || e.isIPv6) continue;
+      if (e.lat == null || e.lon == null) continue;
+      if (!e.country || e.country === 'Unknown') continue;
+      var la = Number(e.lat), lo = Number(e.lon);
+      if (isNaN(la) || isNaN(lo)) continue;
+      attackerPoints.push({
+        ip: e.ip || '', count: e.count || 0, jail: e.jail || '',
+        city: e.city || '', country: e.country || '', lat: la, lon: lo
+      });
+    }
+
+    var maxCount = 1;
+    for (var k = 0; k < attackerPoints.length; k++) {
+      if (attackerPoints[k].count > maxCount) maxCount = attackerPoints[k].count;
+    }
+    if (maxCount < 1) maxCount = 1;
+
+    function lnScale(c) {
+      if (!c || c <= 0) return 0;
+      return Math.log(c + 1) / Math.log(maxCount + 1);
+    }
+
+    // --- 5. Arc data (one per attacking IP, only when server known) ---
+    var arcData = [];
+    if (serverCoord) {
+      var curvenessPattern = [0.08, -0.15, 0.22, -0.08, 0.28, -0.22, 0.12, -0.18, 0.25, -0.12];
+      for (var m = 0; m < attackerPoints.length; m++) {
+        var a = attackerPoints[m];
+        var c = jailColorFor(a.jail) || accentColor;
+        arcData.push({
+          name: a.ip,
+          ip: a.ip,
+          count: a.count,
+          jail: a.jail,
+          city: a.city,
+          country: a.country,
+          coords: [[a.lon, a.lat], serverCoord],
+          lineStyle: {
+            color: c,
+            width: 0.75,
+            opacity: 0.35,
+            curveness: curvenessPattern[m % curvenessPattern.length],
+            type: 'solid',
+            cap: 'round'
+          }
+        });
+      }
+    }
+
+    // --- 6. Server pin data (only when server known) ---
+    var serverData = [];
+    if (serverCoord) {
+      serverData.push({
+        name: t('map.server'),
+        value: [serverCoord[0], serverCoord[1], 1]
+      });
+    }
+
+    // --- 7. Attacker scatter (only when NO server — fallback #3) ---
+    var attackerScatterData = [];
+    if (!serverCoord) {
+      for (var n = 0; n < attackerPoints.length; n++) {
+        var p = attackerPoints[n];
+        var pc = jailColorFor(p.jail) || accentColor;
+        attackerScatterData.push({
+          name: p.ip,
+          ip: p.ip,
+          count: p.count,
+          jail: p.jail,
+          city: p.city,
+          country: p.country,
+          value: [p.lon, p.lat, p.count],
+          symbolSize: 6 + lnScale(p.count) * 18,
+          itemStyle: { color: pc, shadowBlur: 6, shadowColor: pc, opacity: 0.9 }
+        });
+      }
+    }
+
+    // Unused legend was historically computed but never wired into the option; left intact for minimal diff.
+    var legendData = [];
+    for (var c = 0; c < mapData.length; c++) {
+      legendData.push(mapData[c].name);
+    }
+    for (var sp = 0; sp < specialLabels.length; sp++) {
+      legendData.push(specialLabels[sp].label);
+    }
+
+    var mapSeriesName = t('map.title') || 'Attacks';
+
+    // --- 8. Tooltip formatter (branches by series type/name) ---
+    function fmtAttacker(d, attacksLabel, suffix) {
+      var html = '<div style="font-weight:600">' + escapeHtml(d.ip || '--') + '</div>';
+      html += '<div style="font-size:12px">' + (d.count ? d.count.toLocaleString() : '--') +
+        ' ' + escapeHtml(attacksLabel) + '</div>';
+      var parts = [];
+      if (d.jail) parts.push(getJailLabel(d.jail));
+      var loc = (d.city || '') + ((d.city && d.country) ? ', ' : '') + (d.country || '');
+      if (loc) parts.push(loc);
+      if (parts.length) {
+        html += '<div style="font-size:12px;color:' + (dark ? '#9ca3af' : '#6b7280') + '">' +
+          escapeHtml(parts.join(' · ')) + '</div>';
+      }
+      if (suffix) {
+        html += '<div style="font-size:12px;color:' + (dark ? '#9ca3af' : '#6b7280') + '">' +
+          escapeHtml(suffix) + '</div>';
+      }
+      return html;
+    }
+
+    // --- 9. Build series array ---
+    var series = [
+      {
+        name: mapSeriesName,
+        type: 'map',
+        map: 'world',
+        geoIndex: 0,
+        data: mapData,
+        emphasis: {
+          label: { show: true, color: '#fff', fontSize: 12 },
+          itemStyle: { areaColor: accentColor, borderColor: '#fff', borderWidth: 1 }
+        },
+        itemStyle: {
+          borderColor: dark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)',
+          borderWidth: 0.5,
+          areaColor: dark ? '#1e2030' : '#e8eaf0'
+        },
+        label: { show: false },
+        selectedMode: false
+      }
+    ];
+
+    if (serverCoord) {
+      if (arcData.length) {
+        series.push({
+          name: mapSeriesName,
+          type: 'lines',
+          coordinateSystem: 'geo',
+          data: arcData,
+          zlevel: 2,
+          blendMode: 'lighter',
+          effect: {
+            show: !reducedMotion,
+            period: 6,
+            trailLength: 0.4,
+            symbol: 'arrow',
+            symbolSize: 7
+          },
+          lineStyle: { type: 'solid', cap: 'round' }
+        });
+      }
+      series.push({
+        name: SERVER_SERIES_NAME,
+        type: 'effectScatter',
+        coordinateSystem: 'geo',
+        data: serverData,
+        symbol: 'pin',
+        symbolSize: 30,
+        zlevel: 3,
+        rippleEffect: { period: 3, brushType: 'stroke', scale: 5 },
+        showEffectOn: reducedMotion ? 'emphasis' : 'render',
+        label: {
+          show: true,
+          position: 'top',
+          color: dark ? '#e8eaf0' : '#1a1c2b',
+          fontSize: 11,
+          fontWeight: 600,
+          formatter: t('map.server'),
+          offset: [0, -8]
+        },
+        itemStyle: {
+          color: serverColor,
+          shadowBlur: 10,
+          shadowColor: serverColor,
+          opacity: 0.9
+        }
+      });
+    } else {
+      if (attackerScatterData.length) {
+        series.push({
+          name: ATTACKER_SERIES_NAME,
+          type: 'effectScatter',
+          coordinateSystem: 'geo',
+          data: attackerScatterData,
+          symbol: 'circle',
+          zlevel: 3,
+          rippleEffect: { period: 4, brushType: 'stroke', scale: 4 },
+          showEffectOn: reducedMotion ? 'emphasis' : 'render',
+          label: { show: false },
+          itemStyle: { opacity: 0.85 }
+        });
+      }
+    }
+
+    // --- 10. Compose option ---
+    var option = {
+      backgroundColor: 'transparent',
+      animation: false,
+
+      tooltip: Object.assign({
+        trigger: 'item',
+        padding: [10, 14],
+        formatter: function (params) {
+          if (!params) return '';
+          if (params.seriesType === 'map') {
+            if (!params.data || params.data.value == null) return escapeHtml(params.name);
+            var d = params.data;
+            var html = '<div style="font-weight:600;margin-bottom:4px">' + escapeHtml(params.name) + '</div>';
+            html += '<div style="font-size:12px">' + t('map.attacksFrom') + ': <b>' +
+              d.value.toLocaleString() + '</b></div>';
+            html += '<div style="font-size:12px;color:' + (dark ? '#9ca3af' : '#6b7280') + '">' +
+              'IPs: ' + d.ipCount + '</div>';
+            return html;
+          }
+          if (params.seriesName === SERVER_SERIES_NAME) {
+            var html = '<div style="font-weight:600">' + escapeHtml(t('map.server')) + '</div>';
+            var locText = '';
+            if (serverMeta.city) locText += serverMeta.city;
+            if (serverMeta.country) locText += (locText ? ', ' : '') + serverMeta.country;
+            if (locText) html += '<div style="font-size:12px">' + escapeHtml(locText) + '</div>';
+            if (serverMeta.ip) {
+              html += '<div style="font-size:12px;color:' + (dark ? '#9ca3af' : '#6b7280') + '">' +
+                escapeHtml(serverMeta.ip) + '</div>';
+            }
+            return html;
+          }
+          if (params.seriesType === 'lines') {
+            return fmtAttacker(params.data || {}, t('map.attacksToServer'), '\u2192 ' + t('map.server'));
+          }
+          if (params.seriesName === ATTACKER_SERIES_NAME) {
+            return fmtAttacker(params.data || {}, t('map.attacksFrom'));
+          }
+          return escapeHtml(params.name || '');
+        }
+      }, getTooltipStyle(colors, dark)),
+
+      geo: {
+        map: 'world',
+        roam: true,
+        scaleLimit: { min: 1, max: 8 },
+        label: { show: false },
+        itemStyle: {
+          areaColor: dark ? '#1e2030' : '#e8eaf0',
+          borderColor: dark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)',
+          borderWidth: 0.5
+        },
+        emphasis: {
+          label: { show: false },
+          itemStyle: {
+            areaColor: accentColor,
+            borderColor: '#fff',
+            borderWidth: 1
+          }
+        },
+        zlevel: 0
+      },
+
+      visualMap: {
+        min: 0,
+        max: maxVal,
+        left: 20,
+        bottom: 20,
+        text: [t('charts.count') + ' \u2191', '\u2193'],
+        textStyle: { color: colors.text, fontSize: 11 },
+        inRange: {
+          color: [lowColor, highColor]
+        },
+        calculable: true,
+        handleStyle: { color: accentColor, borderColor: accentColor },
+        itemWidth: 12,
+        itemHeight: 120
+      },
+
+      series: series
+    };
+
+    chart.setOption(option, true);
+  }
+
+  /**
+   * Render a fallback country list table when the world map cannot load.
+   * @param {string} containerId - DOM element ID
+   * @param {Array} topIPs - Array of top IP objects
+   */
+  function renderWorldMapFallback(containerId, topIPs) {
+    var dom = document.getElementById(containerId);
+    if (!dom) return;
+
+    // Destroy any existing chart instance
+    if (chartInstances[containerId]) {
+      chartInstances[containerId].dispose();
+      delete chartInstances[containerId];
+    }
+
+    var aggregated = aggregateByCountry(topIPs || []);
+    var mapData = aggregated.mapData;
+    var specialLabels = aggregated.specialLabels;
+
+    // Sort by attack count descending
+    mapData.sort(function (a, b) { return b.value - a.value; });
+
+    var html = '<div class="world-map-fallback">' +
+      '<div class="world-map-fallback__notice">Map unavailable (GeoJSON failed to load). Showing country list instead.</div>' +
+      '<div class="ip-table-wrapper"><table class="ip-table">' +
+      '<thead><tr>' +
+        '<th>#</th>' +
+        '<th>Country</th>' +
+        '<th>Attacks</th>' +
+        '<th>IPs</th>' +
+      '</tr></thead><tbody>';
+
+    for (var i = 0; i < mapData.length; i++) {
+      var entry = mapData[i];
+      html += '<tr>' +
+        '<td class="ip-table__rank">' + (i + 1) + '</td>' +
+        '<td class="ip-table__country">' + escapeHtml(entry.name) + '</td>' +
+        '<td class="ip-table__count">' + Number(entry.value).toLocaleString() + '</td>' +
+        '<td>' + entry.ipCount + '</td>' +
+      '</tr>';
+    }
+
+    html += '</tbody></table></div>';
+
+    if (specialLabels.length) {
+      html += '<div class="world-map-fallback__special">';
+      for (var s = 0; s < specialLabels.length; s++) {
+        html += '<span>' + escapeHtml(specialLabels[s].label) + ': ' + specialLabels[s].count + ' (' + specialLabels[s].ipCount + ' IPs)</span>';
+      }
+      html += '</div>';
+    }
+
+    html += '</div>';
+    dom.innerHTML = html;
+  }
+
+// ============================================================
+  // Per-Jail Mini Chart
+  // ============================================================
+
+  /**
+   * Render a mini bar chart for per-jail attack trend.
+   * Shows the last 7 days of attack data for the selected jail.
+   * @param {string} jail - Jail name ('sshd' or 'asterisk')
+   * @param {object} data - Full dashboard JSON object
+   */
+  function renderPerJailMiniChart(jail, data) {
+    var chartId = 'jail-attack-trend-chart';
+    var chart = getChartInstance(chartId);
+    if (!chart) return;
+
+    var jailData = data.perJail[jail];
+    if (!jailData || !jailData.attackTrend || !jailData.attackTrend.length) {
+      chart.clear();
+      chart.setOption({
+        title: {
+          text: t('errors.noData'),
+          left: 'center',
+          top: 'center',
+          textStyle: { color: getCSSVar('--text-muted'), fontSize: 14 }
+        }
+      });
+      return;
+    }
+
+    var colors = getChartColors();
+    var dark = isDarkTheme();
+
+    // Find jail index for color palette
+    var jailNames = (window._dashboardData && window._dashboardData.meta && window._dashboardData.meta.jailNames)
+      ? window._dashboardData.meta.jailNames
+      : [];
+    var jailIdx = jailNames.indexOf(jail);
+    if (jailIdx < 0) jailIdx = 0;
+    var jailColor = getJailColor(jailIdx);
+    var jailLabel = getJailLabel(jail);
+
+    var trends = data.trends || [];
+    var attackTrend = jailData.attackTrend;
+    var dates = [];
+    var values = [];
+
+    var startIdx = 0;
+    for (var i = startIdx; i < attackTrend.length; i++) {
+      if (i < trends.length) {
+        dates.push(trends[i].date);
+      } else {
+        dates.push('Day ' + (i + 1));
+      }
+      values.push(attackTrend[i]);
+    }
+
+    var displayDates = dates.map(function (d) {
+      if (dates.length > 5) {
+        var parts = d.split('-');
+        return parts.length >= 3 ? parts[1] + '-' + parts[2] : d;
+      }
+      return d;
+    });
+
+    var option = {
+      backgroundColor: 'transparent',
+      animation: false,
+
+      tooltip: Object.assign({
+        trigger: 'axis',
+        textStyle: { fontSize: 12 },
+        formatter: function (params) {
+          if (!params || !params.length) return '';
+          var dateStr = dates[params[0].dataIndex] || params[0].axisValue;
+          return '<b>' + dateStr + '</b><br/>' +
+            params[0].seriesName + ': <b>' + Number(params[0].value).toLocaleString() + '</b>';
+        }
+      }, getTooltipStyle(colors, dark), {
+        textStyle: { color: dark ? '#e8eaf0' : '#1a1c2b', fontSize: 12 }
+      }),
+
+      grid: {
+        left: 50,
+        right: 16,
+        top: 16,
+        bottom: 30,
+        containLabel: false
+      },
+
+      xAxis: {
+        type: 'category',
+        data: displayDates,
+        axisLine: { lineStyle: { color: colors.grid } },
+        axisTick: { lineStyle: { color: colors.grid } },
+        axisLabel: {
+          color: colors.text,
+          fontSize: 11,
+          rotate: dates.length > 5 ? 45 : 0
+        },
+        splitLine: { show: false }
+      },
+
+      yAxis: {
+        type: 'value',
+        axisLine: { show: false },
+        axisTick: { show: false },
+        axisLabel: {
+          color: colors.text,
+          fontSize: 11,
+          formatter: function (val) {
+            return val >= 1000 ? (val / 1000).toFixed(val >= 10000 ? 0 : 1) + 'k' : val;
+          }
+        },
+        splitLine: { lineStyle: { color: colors.grid, type: 'dashed' } }
+      },
+
+      series: [{
+        name: jailLabel,
+        type: 'bar',
+        data: values,
+        itemStyle: {
+          color: jailColor,
+          borderRadius: [3, 3, 0, 0]
+        },
+        barMaxWidth: 24,
+        emphasis: {
+          itemStyle: { opacity: 0.85 }
+        }
+      }]
+    };
+
+    chart.setOption(option, true);
+  }
+
+  // ============================================================
+  // Region Chart (Top Attack Source Countries)
+  // ============================================================
+
+  /** Store last render params for region chart re-render on theme/i18n change */
+  var _regionChartRenderParams = null;
+
+  /**
+   * Render top attack source countries as a donut chart.
+   * Only the top IPs have GeoIP-enriched country data; unknown countries are
+   * filtered out so the chart reflects the available signal rather than noise.
+   * @param {string} containerId - DOM element ID for the chart container
+   * @param {object[]} topIPs - Top attacking IPs array with country and count
+   */
+  function renderRegionChart(containerId, topIPs) {
+    // Store params for re-render on theme/i18n change
+    _regionChartRenderParams = { containerId: containerId, topIPs: topIPs };
+
+    var chart = getChartInstance(containerId);
+    if (!chart) return;
+
+    var colors = getChartColors();
+    var dark = isDarkTheme();
+
+    // Aggregate by country, filtering out unknown/missing
+    var countryMap = {};
+    var totalAttacks = 0;
+    topIPs = topIPs || [];
+    for (var i = 0; i < topIPs.length; i++) {
+      var ip = topIPs[i];
+      if (!ip || !ip.country || ip.country === 'Unknown') continue;
+      var country = ip.country;
+      var count = ip.count || 0;
+      if (!countryMap[country]) countryMap[country] = 0;
+      countryMap[country] += count;
+      totalAttacks += count;
+    }
+
+    var countries = Object.keys(countryMap);
+    var pieData = [];
+    for (var j = 0; j < countries.length; j++) {
+      var c = countries[j];
+      pieData.push({
+        name: c,
+        value: countryMap[c],
+        itemStyle: { color: getJailColor(j) }
+      });
+    }
+    pieData.sort(function (a, b) { return b.value - a.value; });
+
+    // Handle empty data
+    if (!pieData.length || totalAttacks === 0) {
+      chart.clear();
+      chart.setOption({
+        title: {
+          text: t('errors.noData'),
+          left: 'center',
+          top: 'center',
+          textStyle: { color: getCSSVar('--text-muted'), fontSize: 14 }
+        }
+      });
+      return;
+    }
+
+    var tooltipTextColor = dark ? '#e8eaf0' : '#1a1c2b';
+
+    var option = {
+      backgroundColor: 'transparent',
+      animation: false,
+
+      tooltip: Object.assign({
+        trigger: 'item',
+        padding: [10, 14],
+        formatter: function (params) {
+          return '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">' +
+            '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + params.color + '"></span>' +
+            '<span>' + params.name + '</span>' +
+            '<span style="margin-left:auto;font-weight:600">' + params.value.toLocaleString() + '</span>' +
+            '</div>' +
+            '<div style="font-size:12px;color:' + tooltipTextColor + ';opacity:0.7;margin-top:2px">' +
+            params.percent + '%</div>';
+        }
+      }, getTooltipStyle(colors, dark)),
+
+      legend: {
+        orient: 'horizontal',
+        bottom: 0,
+        left: 'center',
+        textStyle: { color: colors.text, fontSize: 12 },
+        icon: 'circle',
+        itemWidth: 10,
+        itemHeight: 10,
+        itemGap: 20,
+        formatter: function (name) {
+          for (var i = 0; i < pieData.length; i++) {
+            if (pieData[i].name === name) {
+              var pct = totalAttacks > 0 ? ((pieData[i].value / totalAttacks) * 100).toFixed(1) : '0.0';
+              return name + '  ' + pct + '%';
+            }
+          }
+          return name;
+        }
+      },
+
+      graphic: [
+        {
+          type: 'text',
+          left: 'center',
+          top: '38%',
+          style: {
+            text: totalAttacks.toLocaleString(),
+            textAlign: 'center',
+            fill: colors.text,
+            fontSize: 22,
+            fontWeight: 700
+          }
+        },
+        {
+          type: 'text',
+          left: 'center',
+          top: '48%',
+          style: {
+            text: t('regionChart.totalAttacks'),
+            textAlign: 'center',
+            fill: colors.text,
+            fontSize: 11,
+            opacity: 0.7
+          }
+        }
+      ],
+
+      series: [
+        {
+          type: 'pie',
+          radius: ['40%', '70%'],
+          center: ['50%', '45%'],
+          avoidLabelOverlap: false,
+          label: { show: false },
+          labelLine: { show: false },
+          emphasis: {
+            label: { show: false },
+            itemStyle: {
+              shadowBlur: 10,
+              shadowOffsetX: 0,
+              shadowColor: 'rgba(0, 0, 0, 0.3)'
+            }
+          },
+          data: pieData
+        }
+      ]
+    };
+
+    chart.setOption(option, true);
+  }
+
+  // ============================================================
+  // Jail Statistics (Donut Chart + Per-Jail Cards)
+  // ============================================================
+
+  /** Store last render params for jail stats re-render on theme/i18n change */
+  var _jailStatsRenderParams = null;
+
+  /**
+   * Render the jail classification donut chart and per-jail detail cards.
+   * @param {string} containerId - DOM element ID for the chart container
+   * @param {object} data - Dashboard data with jails and perJail objects
+   */
+  function renderJailStats(containerId, data) {
+    if (!data || !data.jails) return;
+
+    // Store params for re-render on theme/i18n change
+    _jailStatsRenderParams = { containerId: containerId, data: data };
+
+    var chart = getChartInstance(containerId);
+    if (!chart) return;
+
+    var colors = getChartColors();
+    var dark = isDarkTheme();
+
+    // Build pie data from jails — dynamic color/label via palette
+    var pieData = [];
+    var totalAttacks = 0;
+    var jailNames = Object.keys(data.jails);
+
+    for (var i = 0; i < jailNames.length; i++) {
+      var name = jailNames[i];
+      var jailData = data.jails[name];
+      var attacks = jailData.attacks || 0;
+      totalAttacks += attacks;
+      pieData.push({
+        name: getJailLabel(name),
+        value: attacks,
+        itemStyle: { color: getJailColor(i) }
+      });
+    }
+
+    // Handle empty data
+    if (!pieData.length || totalAttacks === 0) {
+      chart.clear();
+      chart.setOption({
+        title: {
+          text: t('errors.noData'),
+          left: 'center',
+          top: 'center',
+          textStyle: { color: getCSSVar('--text-muted'), fontSize: 14 }
+        }
+      });
+      return;
+    }
+
+    var tooltipTextColor = dark ? '#e8eaf0' : '#1a1c2b';
+
+    var option = {
+      backgroundColor: 'transparent',
+      animation: false,
+
+      tooltip: Object.assign({
+        trigger: 'item',
+        padding: [10, 14],
+        formatter: function (params) {
+          return '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">' +
+            '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + params.color + '"></span>' +
+            '<span>' + params.name + '</span>' +
+            '<span style="margin-left:auto;font-weight:600">' + params.value.toLocaleString() + '</span>' +
+            '</div>' +
+            '<div style="font-size:12px;color:' + tooltipTextColor + ';opacity:0.7;margin-top:2px">' +
+            params.percent + '%</div>';
+        }
+      }, getTooltipStyle(colors, dark)),
+
+      legend: {
+        orient: 'horizontal',
+        bottom: 0,
+        left: 'center',
+        textStyle: { color: colors.text, fontSize: 12 },
+        icon: 'circle',
+        itemWidth: 10,
+        itemHeight: 10,
+        itemGap: 20,
+        formatter: function (name) {
+          for (var i = 0; i < pieData.length; i++) {
+            if (pieData[i].name === name) {
+              var pct = totalAttacks > 0 ? ((pieData[i].value / totalAttacks) * 100).toFixed(1) : '0.0';
+              return name + '  ' + pct + '%';
+            }
+          }
+          return name;
+        }
+      },
+
+      graphic: [
+        {
+          type: 'text',
+          left: 'center',
+          top: '38%',
+          style: {
+            text: totalAttacks.toLocaleString(),
+            textAlign: 'center',
+            fill: colors.text,
+            fontSize: 22,
+            fontWeight: 700
+          }
+        },
+        {
+          type: 'text',
+          left: 'center',
+          top: '48%',
+          style: {
+            text: t('jailStats.totalAttacks'),
+            textAlign: 'center',
+            fill: colors.text,
+            fontSize: 11,
+            opacity: 0.7
+          }
+        }
+      ],
+
+      series: [
+        {
+          type: 'pie',
+          radius: ['40%', '70%'],
+          center: ['50%', '45%'],
+          avoidLabelOverlap: false,
+          label: { show: false },
+          labelLine: { show: false },
+          emphasis: {
+            label: { show: false },
+            itemStyle: {
+              shadowBlur: 10,
+              shadowOffsetX: 0,
+              shadowColor: 'rgba(0, 0, 0, 0.3)'
+            }
+          },
+          data: pieData
+        }
+      ]
+    };
+
+    chart.setOption(option, true);
+  }
+
+  // ============================================================
+  // Public API
+  // ============================================================
+
+  window.renderTrendChart = renderTrendChart;
+  window.renderTimelineChart = renderTimelineChart;
+  window.renderTopIPsTable = renderTopIPsTable;
+  window.renderHeatmap = renderHeatmap;
+  window.renderWorldMap = renderWorldMap;
+  window.renderRegionChart = renderRegionChart;
+  window.renderJailStats = renderJailStats;
+  window.getChartInstance = getChartInstance;
+  window.refreshChartsOnThemeChange = refreshChartsOnThemeChange;
+  window.getCSSVar = getCSSVar;
+  window.getChartColors = getChartColors;
+  window.renderPerJailMiniChart = renderPerJailMiniChart;
+  window.renderWorldMapFallback = renderWorldMapFallback;
+  window.getJailColor = getJailColor;
+  window.getJailLabel = getJailLabel;
+  window.disposeChartInstance = function (id) {
+    if (chartInstances[id]) {
+      chartInstances[id].dispose();
+      delete chartInstances[id];
+    }
+  };
+
+})();
