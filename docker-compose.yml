@@ -8,7 +8,7 @@ services:
       F2B_ADMIN_USERNAME: ${F2B_ADMIN_USERNAME:-admin}
       F2B_ADMIN_PASSWORD: ${F2B_ADMIN_PASSWORD:?Set F2B_ADMIN_PASSWORD in .env}
       F2B_COOKIE_SECURE: ${F2B_COOKIE_SECURE:-false}
-      F2B_GEOIP_DB: /geoip/GeoLite2-City.mmdb
+      F2B_GEOIP_DB: /geoip/GeoLite2-Country.mmdb
     volumes:
       - dashboard-data:/var/lib/f2b-dashboard
       - ./geoip:/geoip:ro
