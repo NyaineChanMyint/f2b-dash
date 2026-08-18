@@ -5,6 +5,9 @@ services:
     image: f2b-dashboard-central:latest
     environment:
       F2B_API_TOKEN: ${F2B_API_TOKEN:?Set F2B_API_TOKEN in .env}
+      F2B_ADMIN_USERNAME: ${F2B_ADMIN_USERNAME:-admin}
+      F2B_ADMIN_PASSWORD: ${F2B_ADMIN_PASSWORD:?Set F2B_ADMIN_PASSWORD in .env}
+      F2B_COOKIE_SECURE: ${F2B_COOKIE_SECURE:-false}
     volumes:
       - dashboard-data:/var/lib/f2b-dashboard
     expose:

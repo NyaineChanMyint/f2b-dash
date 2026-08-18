@@ -5,28 +5,40 @@ Run behind a TLS reverse proxy in production.  Agents authenticate with the
 shared F2B_API_TOKEN supplied to both the server and every agent.
 """
 import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import sqlite3
-import threading
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = ROOT / "web"
 DB_PATH = Path(os.environ.get("F2B_DASHBOARD_DB", ROOT / "data" / "central.db"))
 API_TOKEN = os.environ.get("F2B_API_TOKEN", "")
+ADMIN_USERNAME = os.environ.get("F2B_ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("F2B_ADMIN_PASSWORD", "")
+SESSION_HOURS = int(os.environ.get("F2B_SESSION_HOURS", "12"))
+COOKIE_SECURE = os.environ.get("F2B_COOKIE_SECURE", "false").lower() == "true"
 MAX_EVENTS = 2_000
 
 
+@contextmanager
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def initialise():
@@ -43,11 +55,65 @@ def initialise():
         );
         CREATE INDEX IF NOT EXISTS events_host_time ON events(host, timestamp);
         CREATE INDEX IF NOT EXISTS events_time ON events(timestamp);
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          password_hash TEXT NOT NULL,
+          password_salt TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+          token_hash TEXT PRIMARY KEY,
+          user_id INTEGER NOT NULL,
+          expires_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
         """)
+        has_user = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+        if not has_user:
+            if not ADMIN_PASSWORD:
+                raise RuntimeError("F2B_ADMIN_PASSWORD is required when creating the first user")
+            if not valid_username(ADMIN_USERNAME):
+                raise RuntimeError("F2B_ADMIN_USERNAME must be 3-64 characters (letters, digits, ., _, -)")
+            conn.execute("INSERT INTO users(username,password_hash,password_salt,created_at) VALUES(?,?,?,?)",
+                         (ADMIN_USERNAME, *password_hash(ADMIN_PASSWORD), iso_now()))
 
 
 def iso_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def valid_username(username):
+    return bool(re.fullmatch(r"[A-Za-z0-9_.-]{3,64}", username))
+
+
+def password_hash(password, salt=None):
+    if not isinstance(password, str) or len(password) < 12:
+        raise ValueError("password must be at least 12 characters")
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 600_000).hex()
+    return digest, salt
+
+
+def valid_password(password, stored_hash, salt):
+    digest, _ = password_hash(password, salt)
+    return hmac.compare_digest(digest, stored_hash)
+
+
+def session_token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_session(user_id):
+    token = secrets.token_urlsafe(32)
+    expires = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + SESSION_HOURS * 3600, timezone.utc)
+    with db() as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (iso_now(),))
+        conn.execute("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+                     (session_token_hash(token), user_id, expires.isoformat().replace("+00:00", "Z"), iso_now()))
+    return token
 
 
 def parse_time(value):
@@ -135,11 +201,38 @@ def dashboard(host=None):
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs): super().__init__(*args, directory=str(WEB_ROOT), **kwargs)
-    def json(self, obj, status=200):
-        body = json.dumps(obj).encode(); self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def json(self, obj, status=200, headers=None):
+        body = json.dumps(obj).encode(); self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items(): self.send_header(key, value)
+        self.end_headers(); self.wfile.write(body)
+    def redirect(self, location):
+        self.send_response(302); self.send_header("Location", location); self.end_headers()
+    def current_user(self):
+        cookie = SimpleCookie(self.headers.get("Cookie"))
+        token = cookie.get("f2b_session")
+        if not token: return None
+        with db() as conn:
+            conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (iso_now(),))
+            return conn.execute("SELECT users.id, users.username FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?", (session_token_hash(token.value), iso_now())).fetchone()
+    def require_user(self):
+        user = self.current_user()
+        if not user: self.json({"error": "authentication required"}, 401)
+        return user
+    def session_cookie(self, token):
+        secure = "; Secure" if COOKIE_SECURE else ""
+        return "f2b_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}".format(token, SESSION_HOURS * 3600) + secure
+    def clear_session_cookie(self):
+        secure = "; Secure" if COOKIE_SECURE else ""
+        return "f2b_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" + secure
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health": return self.json({"ok": True})
+        if parsed.path == "/api/auth/me":
+            user = self.current_user()
+            return self.json({"user": dict(user)} if user else {"error": "authentication required"}, 200 if user else 401)
+        if parsed.path == "/":
+            if not self.current_user(): return self.redirect("/login.html")
+        if parsed.path in {"/api/hosts", "/api/dashboard"} and not self.require_user(): return
         if parsed.path == "/api/hosts":
             with db() as conn: hosts = [dict(r) for r in conn.execute("SELECT name, last_seen FROM hosts ORDER BY name")]
             return self.json({"hosts": hosts})
@@ -148,6 +241,22 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json(dashboard(host))
         return super().do_GET()
     def do_POST(self):
+        if self.path == "/api/auth/login":
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if size > 10_000: raise ValueError("request too large")
+                payload = json.loads(self.rfile.read(size)); username = str(payload.get("username", "")); password = payload.get("password", "")
+                with db() as conn: user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+                if not user or not valid_password(password, user["password_hash"], user["password_salt"]):
+                    return self.json({"error": "invalid username or password"}, 401)
+                token = create_session(user["id"])
+                return self.json({"user": {"username": user["username"]}}, headers={"Set-Cookie": self.session_cookie(token)})
+            except (ValueError, json.JSONDecodeError): return self.json({"error": "invalid login request"}, 400)
+        if self.path == "/api/auth/logout":
+            cookie = SimpleCookie(self.headers.get("Cookie")); token = cookie.get("f2b_session")
+            if token:
+                with db() as conn: conn.execute("DELETE FROM sessions WHERE token_hash=?", (session_token_hash(token.value),))
+            return self.json({"ok": True}, headers={"Set-Cookie": self.clear_session_cookie()})
         if self.path != "/api/v1/events": return self.send_error(404)
         if not API_TOKEN or self.headers.get("X-Api-Token") != API_TOKEN: return self.json({"error": "unauthorized"}, 401)
         try:
@@ -173,3 +282,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     print("Serving dashboard on http://0.0.0.0:%d" % port)
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+

@@ -18,7 +18,7 @@ volume, so it survives container recreation.
 
 ```bash
 cp .env.example .env
-# edit .env and set a long random F2B_API_TOKEN
+# edit .env and set F2B_API_TOKEN plus the initial admin password
 docker compose up -d --build
 docker compose ps
 ```
@@ -34,7 +34,38 @@ The included Nginx configuration is HTTP-only for straightforward local/LAN
 use. Before agents send data across an untrusted network, put this stack behind
 TLS (for example, a Caddy/Traefik proxy or an Nginx `listen 443 ssl` virtual
 host with your certificates) and set `F2B_CENTRAL_URL=https://...` on agents.
-Never forward the event endpoint over plain Internet HTTP.
+Never forward the event endpoint over plain Internet HTTP. Once TLS is enabled,
+set `F2B_COOKIE_SECURE=true` in `.env` and restart the stack.
+
+### Dashboard login
+
+Authentication uses the same SQLite database as the event store. On the first
+start, the service creates the initial local user from these `.env` values:
+
+```env
+F2B_ADMIN_USERNAME=admin
+F2B_ADMIN_PASSWORD=use-a-unique-password-with-at-least-12-characters
+```
+
+Open the dashboard and sign in with those credentials. Passwords are stored as
+salted PBKDF2-SHA256 hashes; sessions are opaque, HttpOnly, SameSite cookies
+and expire after 12 hours. The user-facing dashboard APIs now require login.
+Remote agents keep using `F2B_API_TOKEN` on `/api/v1/events`, independently of
+dashboard login.
+
+Create an additional dashboard user with the management command. Passwords are
+environment variables rather than command-line arguments, so they do not land
+in shell history:
+
+```bash
+docker compose exec \
+  -e F2B_NEW_USERNAME=analyst \
+  -e F2B_NEW_PASSWORD='a-unique-long-password' \
+  dashboard python3 app/manage_users.py
+```
+
+Add `--reset` to replace an existing user's password. Restarting the container
+does not overwrite users already stored in SQLite.
 
 Install this repository on the central machine, choose a strong shared token, then start it behind HTTPS (Nginx/Caddy/Traefik):
 
@@ -83,3 +114,4 @@ Open `http://localhost:8080`. For a production deployment, use a reverse proxy w
 ## Attribution
 
 The `web/` dashboard assets derive from [a-lang/f2b-dashboard](https://github.com/a-lang/f2b-dashboard), licensed under MIT. This project is an architectural extension for central collection.
+
