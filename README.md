@@ -37,6 +37,25 @@ host with your certificates) and set `F2B_CENTRAL_URL=https://...` on agents.
 Never forward the event endpoint over plain Internet HTTP. Once TLS is enabled,
 set `F2B_COOKIE_SECURE=true` in `.env` and restart the stack.
 
+### Attack-country lookup
+
+Country, city, and map coordinates come from a local MaxMind GeoLite2 City
+database. Download `GeoLite2-City.mmdb` from [MaxMind GeoLite](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data), then place it here on the Docker host:
+
+```text
+./geoip/GeoLite2-City.mmdb
+```
+
+The Compose stack mounts that file read-only. Restart after adding or replacing
+it:
+
+```bash
+docker compose up -d --build
+```
+
+No attacker IP addresses are sent to an external GeoIP API. Existing events are
+enriched the next time the dashboard loads; their results are cached in SQLite.
+
 ### Dashboard login
 
 Authentication uses the same SQLite database as the event store. On the first
@@ -52,6 +71,9 @@ salted PBKDF2-SHA256 hashes; sessions are opaque, HttpOnly, SameSite cookies
 and expire after 12 hours. The user-facing dashboard APIs now require login.
 Remote agents keep using `F2B_API_TOKEN` on `/api/v1/events`, independently of
 dashboard login.
+
+The bootstrap account is an administrator. When signed in as an administrator,
+use the **Create user** button in the dashboard header to add viewer accounts.
 
 Create an additional dashboard user with the management command. Passwords are
 environment variables rather than command-line arguments, so they do not land

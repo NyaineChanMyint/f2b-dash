@@ -1,1 +1,1 @@
-# No third-party Python dependencies are required.
+maxminddb>=2.6,<3

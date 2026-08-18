@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import sqlite3
+import ipaddress
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = ROOT / "web"
 DB_PATH = Path(os.environ.get("F2B_DASHBOARD_DB", ROOT / "data" / "central.db"))
 API_TOKEN = os.environ.get("F2B_API_TOKEN", "")
+GEOIP_DB = Path(os.environ.get("F2B_GEOIP_DB", ""))
 ADMIN_USERNAME = os.environ.get("F2B_ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("F2B_ADMIN_PASSWORD", "")
 SESSION_HOURS = int(os.environ.get("F2B_SESSION_HOURS", "12"))
@@ -71,6 +73,14 @@ def initialise():
           FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
+        CREATE TABLE IF NOT EXISTS geoip_cache (
+          ip TEXT PRIMARY KEY,
+          country TEXT NOT NULL,
+          city TEXT,
+          lat REAL,
+          lon REAL,
+          looked_up_at TEXT NOT NULL
+        );
         """)
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
         if "role" not in columns:
@@ -131,6 +141,38 @@ def parse_time(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def lookup_geoip(ip):
+    """Return cached local GeoLite data; never sends attacker IPs externally."""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return {"country": "Unknown", "city": None, "lat": None, "lon": None}
+    if address.is_private or address.is_loopback or address.is_reserved:
+        return {"country": "Internal/Private", "city": None, "lat": None, "lon": None}
+    with db() as conn:
+        cached = conn.execute("SELECT country, city, lat, lon FROM geoip_cache WHERE ip=?", (ip,)).fetchone()
+    if cached:
+        return dict(cached)
+    if not GEOIP_DB.is_file():
+        return {"country": "Unknown", "city": None, "lat": None, "lon": None}
+    try:
+        import maxminddb
+        with maxminddb.open_database(str(GEOIP_DB)) as reader:
+            record = reader.get(ip) or {}
+        country = (record.get("country", {}).get("names", {}).get("en") or
+                   record.get("registered_country", {}).get("names", {}).get("en") or "Unknown")
+        city = record.get("city", {}).get("names", {}).get("en")
+        location = record.get("location", {})
+        result = {"country": country, "city": city, "lat": location.get("latitude"), "lon": location.get("longitude")}
+    except (OSError, ValueError, ImportError):
+        result = {"country": "Unknown", "city": None, "lat": None, "lon": None}
+    if result["country"] != "Unknown":
+        with db() as conn:
+            conn.execute("INSERT OR REPLACE INTO geoip_cache(ip,country,city,lat,lon,looked_up_at) VALUES(?,?,?,?,?,?)",
+                         (ip, result["country"], result["city"], result["lat"], result["lon"], iso_now()))
+    return result
+
+
 def event_jail(row, selected_host):
     return row["jail"] if selected_host else row["host"] + "/" + row["jail"]
 
@@ -174,10 +216,12 @@ def dashboard(host=None):
     active_by_jail = Counter(event_jail(r, host) for r in active)
     for r in active:
         per_jail_banned[event_jail(r, host)].append(r)
-    top_ips = [{"ip": ip, "count": count, "jail": ip_jail[ip], "country": "Unknown", "city": None,
-                "lat": None, "lon": None, "lastSeen": ip_last[ip], "isBanned": any(x["ip"] == ip for x in active),
-                "banCount": ip_bans[ip], "isPrivate": ip.startswith(("10.", "192.168.", "127.")), "isIPv6": ":" in ip}
-               for ip, count in ip_count.most_common(20)]
+    top_ips = []
+    for ip, count in ip_count.most_common(20):
+        geo = lookup_geoip(ip)
+        top_ips.append({"ip": ip, "count": count, "jail": ip_jail[ip], **geo, "lastSeen": ip_last[ip],
+                        "isBanned": any(x["ip"] == ip for x in active), "banCount": ip_bans[ip],
+                        "isPrivate": ipaddress.ip_address(ip).is_private, "isIPv6": ":" in ip})
     timeline_data = []
     for stamp in sorted(timeline):
         item = {"timestamp": stamp, "total": sum(timeline[stamp].values())}
@@ -195,8 +239,8 @@ def dashboard(host=None):
             "totalBans": jail_bans[jail], "totalUnbans": jail_unbans[jail], "currentBanned": active_by_jail[jail],
             "uniqueIPs": len(per_jail_ips[jail]), "attackTrend": attack_trend, "topCountries": [],
             "hourlyDistribution": {str(h): 0 for h in range(24)},
-            "topIPs": [{"ip": ip, "count": n, "country": "Unknown"} for ip, n in per_jail_ips[jail].most_common(10)],
-            "bannedIPs": [{"ip": r["ip"], "lastBannedAt": r["timestamp"], "country": "Unknown"} for r in banned]}
+            "topIPs": [{"ip": ip, "count": n, "country": lookup_geoip(ip)["country"]} for ip, n in per_jail_ips[jail].most_common(10)],
+            "bannedIPs": [{"ip": r["ip"], "lastBannedAt": r["timestamp"], "country": lookup_geoip(r["ip"])["country"]} for r in banned]}
     recent = [{"timestamp": r["timestamp"], "type": r["kind"], "ip": r["ip"] or "", "jail": event_jail(r, host),
                "message": "[{}] {}".format(r["host"], r["message"] or r["kind"])} for r in reversed(rows[-100:])]
     return {"meta": {"generatedAt": iso_now(), "lastUpdated": iso_now(), "timezone": "UTC", "jailNames": jails,
