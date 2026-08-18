@@ -49,6 +49,7 @@
         >
           &#127760;
         </button>
+        <button type="button" class="btn hidden" id="create-user-button">Create user</button>
         <button type="button" class="btn" id="logout-button" aria-label="Sign out">Sign out</button>
         <div class="refresh-selector">
           <label class="refresh-selector__label" for="refresh-interval" data-i18n="header.refreshInterval">Refresh</label>
@@ -78,6 +79,22 @@
     </header>
 
     <div id="error-banner" class="error-banner hidden" data-i18n="errors.dataUnavailable">Data unavailable</div>
+
+    <dialog id="create-user-dialog" class="user-dialog" aria-labelledby="create-user-title">
+      <form id="create-user-form" method="dialog">
+        <div class="user-dialog__header">
+          <h2 id="create-user-title">Create dashboard user</h2>
+          <button type="button" class="btn btn--icon" id="close-user-dialog" aria-label="Close">×</button>
+        </div>
+        <p>New accounts can view the dashboard. Only administrators can create users.</p>
+        <label for="new-username">Username</label>
+        <input id="new-username" name="username" autocomplete="username" pattern="[A-Za-z0-9_.-]{3,64}" required>
+        <label for="new-password">Password</label>
+        <input id="new-password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+        <p class="user-dialog__error" id="create-user-error" role="alert"></p>
+        <div class="user-dialog__actions"><button type="button" class="btn" id="cancel-user-dialog">Cancel</button><button type="submit" class="btn btn--accent">Create user</button></div>
+      </form>
+    </dialog>
 
     <!-- ===== Main Content ===== -->
     <main id="main-content" class="dashboard-main">

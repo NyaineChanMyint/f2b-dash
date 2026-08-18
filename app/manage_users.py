@@ -30,9 +30,10 @@ def main():
             conn.execute("UPDATE users SET password_hash=?, password_salt=? WHERE id=?", (digest, salt, existing["id"]))
             print("Password reset for user: " + username)
         else:
-            conn.execute("INSERT INTO users(username,password_hash,password_salt,created_at) VALUES(?,?,?,?)", (username, digest, salt, central.iso_now()))
+            conn.execute("INSERT INTO users(username,password_hash,password_salt,role,created_at) VALUES(?,?,?,?,?)", (username, digest, salt, "viewer", central.iso_now()))
             print("Created user: " + username)
 
 
 if __name__ == "__main__":
     main()
+

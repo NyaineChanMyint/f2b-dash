@@ -50,6 +50,37 @@
     } catch (err) { console.warn('Dashboard: could not load host list', err); }
   }
 
+  async function setupUserManagement() {
+    var button = document.getElementById('create-user-button');
+    var dialog = document.getElementById('create-user-dialog');
+    var form = document.getElementById('create-user-form');
+    if (!button || !dialog || !form) return;
+    try {
+      var response = await fetch('/api/auth/me');
+      if (!response.ok) return;
+      var payload = await response.json();
+      if (!payload.user || payload.user.role !== 'admin') return;
+      button.classList.remove('hidden');
+      button.addEventListener('click', function () { dialog.showModal(); });
+      document.getElementById('close-user-dialog').addEventListener('click', function () { dialog.close(); });
+      document.getElementById('cancel-user-dialog').addEventListener('click', function () { dialog.close(); });
+      form.addEventListener('submit', async function (event) {
+        event.preventDefault();
+        var error = document.getElementById('create-user-error');
+        error.textContent = '';
+        var submit = form.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        try {
+          var result = await fetch('/api/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: form.username.value, password: form.password.value }) });
+          var body = await result.json();
+          if (!result.ok) { error.textContent = body.error || 'Could not create user.'; return; }
+          form.reset(); dialog.close();
+        } catch (err) { error.textContent = 'Could not create user.'; }
+        finally { submit.disabled = false; }
+      });
+    } catch (err) { console.warn('Dashboard: could not load user permissions', err); }
+  }
+
   // --- Time Range Change Handler ---
 
   function onTimeRangeChanged() {
@@ -808,6 +839,7 @@
         window.location.assign('/login.html');
       });
     }
+    await setupUserManagement();
 
     // Time range selector
     var timeRangeSelect = document.getElementById('time-range');
@@ -862,3 +894,4 @@
     init();
   }
 })();
+

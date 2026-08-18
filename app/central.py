@@ -60,6 +60,7 @@ def initialise():
           username TEXT NOT NULL UNIQUE COLLATE NOCASE,
           password_hash TEXT NOT NULL,
           password_salt TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'viewer',
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS sessions (
@@ -71,14 +72,24 @@ def initialise():
         );
         CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
         """)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        if "role" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'viewer'")
         has_user = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
         if not has_user:
             if not ADMIN_PASSWORD:
                 raise RuntimeError("F2B_ADMIN_PASSWORD is required when creating the first user")
             if not valid_username(ADMIN_USERNAME):
                 raise RuntimeError("F2B_ADMIN_USERNAME must be 3-64 characters (letters, digits, ., _, -)")
-            conn.execute("INSERT INTO users(username,password_hash,password_salt,created_at) VALUES(?,?,?,?)",
-                         (ADMIN_USERNAME, *password_hash(ADMIN_PASSWORD), iso_now()))
+            conn.execute("INSERT INTO users(username,password_hash,password_salt,role,created_at) VALUES(?,?,?,?,?)",
+                         (ADMIN_USERNAME, *password_hash(ADMIN_PASSWORD), "admin", iso_now()))
+        elif not conn.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1").fetchone():
+            # Upgrade databases created before roles existed without locking out
+            # the configured bootstrap administrator.
+            bootstrap = conn.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE LIMIT 1", (ADMIN_USERNAME,)).fetchone()
+            if not bootstrap:
+                bootstrap = conn.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+            conn.execute("UPDATE users SET role='admin' WHERE id=?", (bootstrap["id"],))
 
 
 def iso_now():
@@ -213,10 +224,16 @@ class Handler(SimpleHTTPRequestHandler):
         if not token: return None
         with db() as conn:
             conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (iso_now(),))
-            return conn.execute("SELECT users.id, users.username FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?", (session_token_hash(token.value), iso_now())).fetchone()
+            return conn.execute("SELECT users.id, users.username, users.role FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?", (session_token_hash(token.value), iso_now())).fetchone()
     def require_user(self):
         user = self.current_user()
         if not user: self.json({"error": "authentication required"}, 401)
+        return user
+    def require_admin(self):
+        user = self.require_user()
+        if user and user["role"] != "admin":
+            self.json({"error": "administrator access required"}, 403)
+            return None
         return user
     def session_cookie(self, token):
         secure = "; Secure" if COOKIE_SECURE else ""
@@ -233,6 +250,11 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/":
             if not self.current_user(): return self.redirect("/login.html")
         if parsed.path in {"/api/hosts", "/api/dashboard"} and not self.require_user(): return
+        if parsed.path == "/api/users" and not self.require_admin(): return
+        if parsed.path == "/api/users":
+            with db() as conn:
+                users = [dict(row) for row in conn.execute("SELECT id, username, role, created_at FROM users ORDER BY username")]
+            return self.json({"users": users})
         if parsed.path == "/api/hosts":
             with db() as conn: hosts = [dict(r) for r in conn.execute("SELECT name, last_seen FROM hosts ORDER BY name")]
             return self.json({"hosts": hosts})
@@ -250,13 +272,27 @@ class Handler(SimpleHTTPRequestHandler):
                 if not user or not valid_password(password, user["password_hash"], user["password_salt"]):
                     return self.json({"error": "invalid username or password"}, 401)
                 token = create_session(user["id"])
-                return self.json({"user": {"username": user["username"]}}, headers={"Set-Cookie": self.session_cookie(token)})
+                return self.json({"user": {"username": user["username"], "role": user["role"]}}, headers={"Set-Cookie": self.session_cookie(token)})
             except (ValueError, json.JSONDecodeError): return self.json({"error": "invalid login request"}, 400)
         if self.path == "/api/auth/logout":
             cookie = SimpleCookie(self.headers.get("Cookie")); token = cookie.get("f2b_session")
             if token:
                 with db() as conn: conn.execute("DELETE FROM sessions WHERE token_hash=?", (session_token_hash(token.value),))
             return self.json({"ok": True}, headers={"Set-Cookie": self.clear_session_cookie()})
+        if self.path == "/api/users":
+            if not self.require_admin(): return
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if size > 10_000: raise ValueError("request too large")
+                payload = json.loads(self.rfile.read(size))
+                username, password = str(payload.get("username", "")).strip(), payload.get("password", "")
+                if not valid_username(username): raise ValueError("invalid username")
+                digest, salt = password_hash(password)
+                with db() as conn:
+                    conn.execute("INSERT INTO users(username,password_hash,password_salt,role,created_at) VALUES(?,?,?,?,?)", (username, digest, salt, "viewer", iso_now()))
+                return self.json({"user": {"username": username, "role": "viewer"}}, 201)
+            except sqlite3.IntegrityError: return self.json({"error": "username already exists"}, 409)
+            except (ValueError, json.JSONDecodeError): return self.json({"error": "username must be valid and password must be at least 12 characters"}, 400)
         if self.path != "/api/v1/events": return self.send_error(404)
         if not API_TOKEN or self.headers.get("X-Api-Token") != API_TOKEN: return self.json({"error": "unauthorized"}, 401)
         try:

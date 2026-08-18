@@ -1172,3 +1172,21 @@ body {
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
+
+/* --- User Management Dialog --- */
+.user-dialog {
+  width: min(calc(100% - 2rem), 430px);
+  padding: var(--space-lg);
+  color: var(--text-primary);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.user-dialog::backdrop { background: rgba(0, 0, 0, .65); }
+.user-dialog__header, .user-dialog__actions { display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm); }
+.user-dialog__header h2 { margin: 0; font-size: var(--text-xl); }
+.user-dialog label { display: block; margin: var(--space-md) 0 var(--space-xs); font-weight: 600; }
+.user-dialog input { box-sizing: border-box; width: 100%; min-height: 38px; padding: var(--space-sm); color: var(--text-primary); background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.user-dialog__error { min-height: 1.25rem; margin: var(--space-sm) 0; color: var(--danger, #ef4444); }
+.user-dialog__actions { justify-content: flex-end; margin-top: var(--space-md); }
+
