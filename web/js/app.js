@@ -801,6 +801,14 @@
       themeBtn.addEventListener('click', toggleTheme);
     }
 
+    var logoutBtn = document.getElementById('logout-button');
+    if (logoutBtn) {
+      logoutBtn.addEventListener('click', async function () {
+        await fetch('/api/auth/logout', { method: 'POST' });
+        window.location.assign('/login.html');
+      });
+    }
+
     // Time range selector
     var timeRangeSelect = document.getElementById('time-range');
     if (timeRangeSelect) {
